@@ -2,8 +2,8 @@
 # github.com/mtrkss
 VARLIST="VIEW_X VIEW_Y OFF_X OFF_Y"
 ROTATE=0
-DEPTH=90
-COLS=4
+DEPTH=8
+COLS=1024
 VIRTUAL=Dither
 
 [ -z "$1" ] && cat <<EOF&&exit
