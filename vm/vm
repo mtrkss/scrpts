@@ -1,0 +1,133 @@
+#!/bin/sh
+#
+# BHYVE virtual machine helper or something
+# ughhhhh
+#
+
+# needed vars
+vmdir=/opt/vmcfg	# directory for random vm stuff such as BIOSes and ISOs
+
+# example + default configs
+vmname=default		# virtual machine name
+vmmem=1G		# amount of ram dedicated to vm (auto = select a sane value automatically)
+netsetup=1		# 1 = set up the network before starting the vm (set to 0 if you passthrough your network adapter)
+tapnum=0		# tap interface numbera
+bridgenum=0		# bridge interface number
+allcores="$(nproc)"	# number of cores/threads for the vm ("$(nproc)" = all of your CPUs)
+multithread=1		# threads per core (1 = threads are equal to cores)
+vmdestroy=1		# 1 = "destroy" (completely shut down) the vm on exit
+vmargs="
+-s 25,e1000,tap$tapnum
+-s 5,fbuf,tcp=0.0.0.0:5900,w=1440,h=900
+"
+
+# random funcs (condensed to saev space or something)
+genmac() { LANG=C hexdump -ve '/1 "%02X-"' /dev/random|head -c14;}
+warn() { printf 'Warning: %s\n' "$@";}
+error() { printf 'Error: %s\n' "$@";exit 1;}
+chk_iface() { ifconfig -l|grep -q "$1";}
+chk_isroot() { [ "$(whoami)" != root ]&&error "Sorry, you have to be root!";}
+
+# vibe check(s)
+if [ "$(uname)" = Linux ] && [ "$BHYVE_WILL_WORK" != 1 ]; then
+	error "You just can't run this on Linux." "If you still want to try, set BHYVE_WILL_WORK to 1."
+elif [ ! -d "$vmdir" ]; then
+	echo "Creating VM config dir."
+	chk_isroot
+	mkdir -p "$vmdir"
+	cp /usr/local/share/uefi-firmware/BHYVE_UEFI_VARS.fd "$vmdir/vars.fd"
+	cp /usr/local/share/uefi-firmware/BHYVE_UEFI_CODE.fd "$vmdir/bios.fd"
+fi
+
+if [ -z "$@" ]; then
+	cat << END && exit
+Usage:
+$ $0 *config name*
+
+This is a simple BHYVE virtual machine manager made in Shell.
+To start using it, create a configuration at "$vmdir/*name*.conf",
+then run the script like "$0 *name*"
+
+This script is not meant to be an automatic VM, but rather a VM helper.
+To use this script you of course need to have at least basic BHYVE knowledge.
+For more info on how to use BHYVE, run "man bhyve".
+END
+elif [ -f "$vmdir/$1.conf" ]; then
+	. "$vmdir/$1.conf"
+	# instantly fix the vmargs variable
+	vmargs="$(echo "$vmargs" | tr '\n' ' ')"
+else
+	error "Config \"$vmdir/$1.conf\" not found!"
+fi
+
+# main functionality
+chk_isroot
+# set the network up (if we need to)
+if [ "$netsetup" = 1 ] && ! chk_iface tap$tapnum; then
+	sysctl net.link.tap.up_on_open=1 
+	for iface in bridge$bridgenum tap$tapnum; do
+		if ! chk_iface $iface; then
+			ifconfig $iface create || warn "Could not create $iface."
+			echo "Created $iface."
+		fi
+	done
+	echo "Choose an interface to use:"
+	ifnames="$(ifconfig -ul | tr ' ' '\n' | grep -ivE '(bridge|tap|lo.*)')"
+	inum=0
+	for iface in $ifnames; do
+		inum=$((inum+1))
+		eval inum_$inum=$iface
+		echo "$inum. $iface"
+	done
+	read -p "[$inum]: " sel_inum
+	if [ -z "$sel_inum" ]; then
+		sel_inum=$inum
+	# hacky way of checking for letters in the selection lol
+	elif echo "$sel_inum" | tr A-z N | grep -q N || [ $((sel_inum > inum)) = 1 ] ; then
+		error "Invalid selection."
+	fi
+	warn "Machines with Intel ethernet might freeze here!"
+	eval ifconfig bridge$bridgenum addm \$inum_$sel_inum addm tap$tapnum || error "Could not add members to bridge interface."
+	ifconfig bridge$bridgenum up || error "Something went wrong :("
+	echo "Network setup done!"
+	unset iface ifnames inum sel_inum inum_$inum
+fi
+
+# sanity checks before spinning up the vm
+if [ ! -f /usr/local/share/uefi-firmware/BHYVE_UEFI.fd ]; then
+	# error "Please install the \"edk2-bhyve\" package"
+	warn "Could not find edk2-bhyve, installing it..."
+	echo "Checking for Internet connection";
+	ping -c1 -t5 1.1.1.1 >/dev/null || echo "Could not connect to the Internet, trying again..." || \
+	ping -c1 -t5 8.8.8.8 >/dev/null || error "No Internet connection."
+	pkg install -y edk2-bhyve || error "Could not install edk2-bhyve."
+fi
+vmnl=$(printf "$vmname"|wc -c)
+[ $((vmnl > 31)) = 1 ] && \
+	error "VM name must not be longer than 31 characters ($vmnl)"
+[ ! -f "$vmdir/vars.fd" ] && \
+	cp /usr/local/share/uefi-firmware/BHYVE_UEFI_VARS.fd "$vmdir/vars.fd"
+[ ! -f "$vmdir/bios.fd" ] && \
+	cp /usr/local/share/uefi-firmware/BHYVE_UEFI_CODE.fd "$vmdir/vars.fd"
+[ -z "$(pgrep sshd)" ] && \
+	warn "sshd not running! If anything goes wrong, you'll not be able to interact with your PC!" && \
+	sleep 1
+if [ "$vmmem" = auto ]; then
+	pagesize=$(sysctl -n hw.pagesize)
+	freepages=$(sysctl -n vm.stats.vm.v_free_count)
+	allmem=$(sysctl -n hw.physmem)
+	vmmem=$((freepages * pagesize / 1048576 - allmem / 10485760))M
+	unset pagesize freepages allmem
+fi
+
+# the vm itself
+[ $vmdestroy = 1 ] && bhyvectl --vm="$vmname" --destroy 2>/dev/null
+cores=$((allcores / multithread))
+bhyve -S -m $vmmem \
+	-c $allcores,sockets=1,cores=$cores,threads=$multithread \
+	-l bootrom,"$vmdir/bios.fd","$vmdir/vars.fd" \
+	-s 0,hostbridge \
+	-s 31,lpc \
+	$vmargs "$vmname"
+[ $vmdestroy = 1 ] && bhyvectl --vm="$vmname" --destroy 2>/dev/null
+

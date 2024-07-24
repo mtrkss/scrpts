@@ -1,0 +1,6 @@
+#!/bin/sh
+cat<<crash|cc -xc -o/tmp/crash -;/tmp/crash
+#include <unistd.h>
+#include <stdlib.h>
+int main(){crash:malloc(10);fork();fork();goto crash;}
+crash
